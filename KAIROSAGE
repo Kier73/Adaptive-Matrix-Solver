@@ -1,0 +1,593 @@
+import random
+import math
+import time
+import sympy
+from typing import List, Any, Dict, Optional, Tuple, Callable
+from dataclasses import dataclass, field
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --- Diffusion Simulation Code (Modified for AGE Integration) ---
+
+def evolve_kernel_with_age_expr(current_nonlinear_trace: np.ndarray, 
+                                time_step: int, 
+                                age_expr_node: 'ExpressionNode', 
+                                N_spatial: int, 
+                                Total_T: int,
+                                available_vars_for_age: List[str]) -> np.ndarray:
+    """
+    Evolves the weights for the diffusion kernel using an AGE-generated expression.
+    """
+    center_idx = N_spatial // 2
+    evolved_weights = np.zeros(N_spatial)
+
+    # Ensure all variables the AGE expression might expect are available
+    # The core variables are m_i, m_c, delta_m, t_norm, i_norm
+    # AGE will select from its configured AVAILABLE_VARIABLES
+
+    for i in range(N_spatial):
+        # Prepare variables for the AGE expression
+        val_m_i = float(current_nonlinear_trace[i])
+        val_m_c = float(current_nonlinear_trace[center_idx])
+        
+        var_values = {
+            'm_i': val_m_i,
+            'm_c': val_m_c,
+            'delta_m': val_m_i - val_m_c,
+            't_norm': float(time_step) / Total_T if Total_T > 0 else 0.0,
+            'i_norm': float(i) / N_spatial if N_spatial > 0 else 0.0
+            # Add other potential variables if AGE_CONF.AVAILABLE_VARIABLES includes them,
+            # though the core set is defined above. For now, AGE will only use what's in its list.
+        }
+        
+        # Filter var_values to only those declared in AGE_CONF.AVAILABLE_VARIABLES
+        # to prevent errors if the expression expects a subset.
+        # This is implicitly handled if age_expr_node.evaluate only pulls what it needs.
+
+        raw_weight_val = age_expr_node.evaluate(var_values)
+
+        if raw_weight_val is not None and math.isfinite(raw_weight_val):
+            # Use sigmoid to keep the weight component in a (0, 1) range and handle any output.
+            # This provides more stability than abs() for potentially large/small raw values.
+            evolved_weights[i] = 1.0 / (1.0 + math.exp(-np.clip(raw_weight_val, -10, 10))) # Clipped sigmoid
+        else:
+            evolved_weights[i] = 0.0 # Fallback for problematic evaluation (e.g. results in small value after sigmoid)
+
+    # If all weights are zero (or close to it), fallback to uniform weights
+    # This prevents the sum of effective_kernel_base from being zero later.
+    if np.sum(evolved_weights) < 1e-9 * N_spatial : # check average weight
+        return np.ones(N_spatial) * 0.5 # Return uniform weights (sigmoid output is 0.5 for input 0)
+
+    return evolved_weights
+
+
+def run_diffusion_simulation(age_expression_node: 'ExpressionNode', 
+                             age_conf_vars: List[str], # From AGE_CONF.AVAILABLE_VARIABLES
+                             N: int, 
+                             T: int, 
+                             base_conv_kernel: np.ndarray,
+                             visualize: bool = False) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Runs the entire diffusion simulation using an AGE-generated expression for kernel evolution.
+    Returns the final grid state.
+    """
+    grid = np.zeros((T, N))
+    initial_condition_diff = np.zeros(N)
+    initial_condition_diff[N // 2] = 1.0
+    grid[0] = initial_condition_diff
+
+    memory_diff = np.zeros(N)
+    
+    # Store the full grid if visualization is requested
+    full_grid_for_vis = np.zeros((T, N)) if visualize else None
+    if visualize:
+        full_grid_for_vis[0] = grid[0]
+
+    for t_step in range(1, T):
+        memory_diff += grid[t_step - 1]
+        nonlinear_trace_diff = np.tanh(memory_diff) * 0.5 + 0.5
+
+        current_weights = evolve_kernel_with_age_expr(
+            nonlinear_trace_diff, t_step, age_expression_node, N, T, age_conf_vars
+        )
+
+        # The original diffusion code convolved a base kernel with these N-long weights
+        effective_kernel_base = np.convolve(base_conv_kernel, current_weights, mode='same')
+        
+        sum_effective_kernel_base = np.sum(effective_kernel_base)
+        if abs(sum_effective_kernel_base) < 1e-9:
+            # This indicates a failure of the AGE expression to produce a viable kernel component.
+            # Return None for final state to indicate failure to the fitness function
+            return None, None 
+        
+        effective_kernel_normalized = effective_kernel_base / sum_effective_kernel_base
+        
+        next_grid_state = np.convolve(grid[t_step - 1], effective_kernel_normalized, mode='same')
+
+        # Check for blow-up or die-out or invalid values
+        if np.any(np.isnan(next_grid_state)) or \
+           np.any(np.isinf(next_grid_state)) or \
+           np.sum(next_grid_state) < 1e-7 or \
+           np.sum(next_grid_state) > 1e7 : # Check for reasonable total concentration
+            return None, None # Simulation failed, return None for fitness eval
+
+        grid[t_step] = next_grid_state
+        if visualize:
+            full_grid_for_vis[t_step] = grid[t_step]
+
+
+    final_grid_state = grid[T - 1]
+    return final_grid_state, full_grid_for_vis
+
+def calculate_diffusion_fitness(final_grid_state: Optional[np.ndarray], N_spatial: int) -> float:
+    """
+    Calculates fitness based on the spread (std dev) of the final concentration.
+    """
+    if final_grid_state is None or final_grid_state.sum() < 1e-6: # Check if simulation died out or failed
+        return 0.0 # Very low fitness
+
+    # Ensure total concentration is somewhat preserved (should be around 1.0)
+    # If it's too far off, it might indicate an unstable kernel from AGE.
+    # This check is partly handled by run_diffusion_simulation returning None.
+    # If np.abs(np.sum(final_grid_state) - 1.0) > 0.5 : # Arbitrary tolerance for mass conservation
+    #    return 0.0 
+
+    positions = np.arange(N_spatial)
+    current_sum = np.sum(final_grid_state)
+    if current_sum < 1e-9 : return 0.0 # Avoid division by zero if sum is extremely small
+
+    mean_pos = np.sum(final_grid_state * positions) / current_sum
+    variance = np.sum(final_grid_state * (positions - mean_pos)**2) / current_sum
+    
+    if variance < 0: return 0.0 # Should not happen with proper calculation
+    std_dev = np.sqrt(variance)
+
+    # Normalize std_dev. Max possible std_dev is roughly N_spatial / 2 (e.g. two points at ends).
+    # A more robust upper bound might be N_spatial / sqrt(12) for a uniform distribution.
+    # For a Gaussian, 99.7% is within 3 std_devs, so N_spatial / 6 could be a rough guide for full spread.
+    # Using N_spatial / 2 as a loose upper scaling factor.
+    max_possible_std_dev = N_spatial / 2.5 # Adjusted for more realistic spread, makes fitness values more sensitive
+    normalized_std_dev = std_dev / max_possible_std_dev
+    
+    return max(0.0, min(1.0, normalized_std_dev)) # Fitness score between 0 and 1
+
+
+# --- Node Classes (expression_nodes.py conceptual module - stable from previous) ---
+class ExpressionNode: # Abstract Base
+    def evaluate(self, var_values: Dict[str, float]) -> Optional[float]: raise NotImplementedError
+    def to_string(self) -> str: raise NotImplementedError
+    def to_sympy_expr(self) -> Optional[sympy.Expr]: raise NotImplementedError
+    def get_complexity(self) -> int: raise NotImplementedError
+
+@dataclass
+class ConstantNode(ExpressionNode):
+    value: float
+    def evaluate(self, var_values: Dict[str,float]) -> Optional[float]: return self.value
+    def to_string(self) -> str: return str(self.value)
+    def to_sympy_expr(self) -> Optional[sympy.Expr]: return sympy.Float(self.value)
+    def get_complexity(self) -> int: return 1
+
+@dataclass
+class VariableNode(ExpressionNode):
+    name: str
+    def evaluate(self, var_values: Dict[str,float]) -> Optional[float]: 
+        val = var_values.get(self.name)
+        if val is None:
+            # print(f"Warning: Variable '{self.name}' not found in var_values: {var_values.keys()}") # Debug
+            return 0.0 # Default to 0 if var missing, to prevent cascading None
+        return val
+    def to_string(self) -> str: return self.name
+    def to_sympy_expr(self) -> Optional[sympy.Expr]: return sympy.Symbol(self.name)
+    def get_complexity(self) -> int: return 1
+
+_UNARY_OPS_MATH: Dict[str, Callable[[float], float]] = {
+    "neg": lambda x: -x, "sin": math.sin, "cos": math.cos, "exp": lambda x: math.exp(np.clip(x,-10,10)), # Clipped exp
+    "log": lambda x: math.log(abs(x) + 1e-9) if abs(x) > 1e-10 else math.log(1e-9), # Protected log
+    "sqrt": lambda x: math.sqrt(abs(x)) if abs(x) >= 1e-9 else 0.0, # Protected sqrt
+    "abs": abs, "tanh": math.tanh, "sig": lambda x: 1.0/(1.0+math.exp(-np.clip(x,-10,10))) # Sigmoid
+}
+_UNARY_OPS_SYMPY: Dict[str, Callable] = {
+    "neg": lambda x: -x, "sin": sympy.sin, "cos": sympy.cos, "exp": sympy.exp,
+    "log": sympy.log, "sqrt": sympy.sqrt, "abs": sympy.Abs, "tanh": sympy.tanh, "sig": lambda x: 1/(1+sympy.exp(-x))
+}
+
+@dataclass
+class UnaryOpNode(ExpressionNode):
+    op_name: str; operand: ExpressionNode
+    def evaluate(self, var_values: Dict[str,float]) -> Optional[float]:
+        if self.op_name not in _UNARY_OPS_MATH: return None
+        val = self.operand.evaluate(var_values)
+        if val is None: return None
+        try:
+            result = _UNARY_OPS_MATH[self.op_name](val)
+            return result if not (math.isnan(result) or math.isinf(result)) else None
+        except Exception: return None
+    def to_string(self) -> str: return f"{self.op_name}({self.operand.to_string()})"
+    def to_sympy_expr(self) -> Optional[sympy.Expr]:
+        if self.op_name not in _UNARY_OPS_SYMPY: return None
+        op_s = self.operand.to_sympy_expr(); 
+        if op_s is None: return None
+        try: return _UNARY_OPS_SYMPY[self.op_name](op_s)
+        except Exception: return None
+    def get_complexity(self) -> int: return 1 + self.operand.get_complexity()
+
+_BINARY_OPS_MATH: Dict[str, Callable[[float, float], float]] = {
+    "+": lambda a,b:a+b, "-": lambda a,b:a-b, "*": lambda a,b:a*b,
+    "/": lambda a,b: a/b if abs(b)>1e-9 else (float('inf') if (a>0 and b>=0)or(a<0 and b<0 and b!=0) else float('-inf') if (a<0 and b>=0)or(a>0 and b<0 and b!=0)else float('nan')), # Original robust division
+    "^": lambda a,b:a**np.clip(b,-5,5) if abs(a)>1e-9 or b>=0 else float('nan') # Clipped and protected power
+}
+_BINARY_OPS_SYMPY: Dict[str, Callable] = {
+    "+": lambda a,b:a+b, "-": lambda a,b:a-b, "*": lambda a,b:a*b,
+    "/": lambda a,b:a/b, "^": lambda a,b:a**b
+}
+
+@dataclass
+class BinaryOpNode(ExpressionNode):
+    op_name: str; left: ExpressionNode; right: ExpressionNode
+    def evaluate(self, var_values: Dict[str,float]) -> Optional[float]:
+        if self.op_name not in _BINARY_OPS_MATH: return None
+        lv, rv = self.left.evaluate(var_values), self.right.evaluate(var_values)
+        if lv is None or rv is None: return None
+        try:
+            # Specific handling from original AGE, slightly adapted
+            if self.op_name == '^': 
+                # Handled by clipped power in _BINARY_OPS_MATH now for robustness
+                # if lv < -1e-9 and not (rv == int(rv)): return None 
+                # if abs(lv) < 1e-9 and rv < 0 : return float('inf') # Avoid this, use protected power
+                pass
+            res = _BINARY_OPS_MATH[self.op_name](lv, rv)
+            return res if not (math.isnan(res) or math.isinf(res)) else None
+        except (OverflowError, ValueError): return None
+        except Exception: return None # Catch any other math errors
+    def to_string(self) -> str: return f"({self.left.to_string()} {self.op_name} {self.right.to_string()})"
+    def to_sympy_expr(self) -> Optional[sympy.Expr]:
+        if self.op_name not in _BINARY_OPS_SYMPY: return None
+        ls, rs = self.left.to_sympy_expr(), self.right.to_sympy_expr()
+        if ls is None or rs is None: return None
+        try: return _BINARY_OPS_SYMPY[self.op_name](ls, rs)
+        except Exception: return None
+    def get_complexity(self) -> int: return 1 + self.left.get_complexity() + self.right.get_complexity()
+
+# --- ComposedStructure (AGE context, housing an ExpressionNode tree) ---
+@dataclass
+class ComposedStructure: 
+    id: str = field(default_factory=lambda: f"struct_expr_{random.randint(1000,9999)}_{int(time.time()*1000)%1000}")
+    expression_tree_root: Optional[ExpressionNode] = None
+    composition_rules_version: float = 0.1 
+    complexity_score: float = 0.0; stability_score: float = 0.0; integrity_score: float = 0.0 
+    novelty_score: float = 0.0; is_emergent_event: bool = False
+    evaluation_details: Dict[str, Any] = field(default_factory=dict) 
+    def __post_init__(self):
+        if self.expression_tree_root: self.complexity_score = float(self.expression_tree_root.get_complexity())
+        else: self.complexity_score = 1000.0 
+        self.novelty_score = random.uniform(0.2,0.8) 
+    def evaluate_expression(self,var_values:Dict[str,float])->Optional[float]: return self.expression_tree_root.evaluate(var_values) if self.expression_tree_root else None
+    def get_expression_string(self)->str: return self.expression_tree_root.to_string() if self.expression_tree_root else "None"
+    def get_sympy_expr(self)->Optional[sympy.Expr]: return self.expression_tree_root.to_sympy_expr() if self.expression_tree_root else None
+    def get_canonical_form(self)->Optional[str]:
+        s_expr = self.get_sympy_expr()
+        if s_expr is not None:
+            try: return str(sympy.simplify(s_expr))
+            except Exception: return str(s_expr) 
+        return None
+    def __str__(self): 
+        root_str=self.get_expression_string(); 
+        if len(root_str)>40: root_str=root_str[:37]+"..." 
+        # Changed from mse_to_dataset to diffusion_fitness
+        fitness_val = self.evaluation_details.get('diffusion_fitness', 0.0) 
+        fitness_str = f"{fitness_val:.3f}" if isinstance(fitness_val, float) else "N/A"
+        return (f"ComposedStruct(ID:{self.id[-5:]}, Fitness(Stab):{self.stability_score:.2f}, SpreadFit:{fitness_str}, Root:'{root_str}')")
+
+
+# --- AGE Configuration ---
+@dataclass
+class AGE_Config:
+    MAX_CYCLES: int = 30 # Reduced for faster combined demo
+    CANDIDATES_PER_CYCLE: int = 20 # Reduced
+    STABILITY_THRESHOLD_FITNESS: float = 0.05 # Adjusted for new fitness metric
+    INTEGRITY_THRESHOLD_FITNESS: float = 0.02 # Adjusted
+    EMERGENCE_FITNESS_THRESHOLD: float = 0.7 # For diffusion spread, higher is very good (e.g. 70% of max possible spread)
+    
+    # Variables for the AGE expression controlling the diffusion kernel
+    AVAILABLE_VARIABLES: List[str] = field(default_factory=lambda: ['m_i', 'm_c', 'delta_m', 't_norm', 'i_norm'])
+    CONSTANT_GENERATION_RANGE: Tuple[float, float] = (-2.5, 2.5) 
+    AVAILABLE_UNARY_OPS: List[str] = field(default_factory=lambda: ["neg", "abs", "sin", "cos", "tanh", "sig", "sqrt", "exp"]) # Added tanh, sig
+    AVAILABLE_BINARY_OPS: List[str] = field(default_factory=lambda: ["+", "-", "*", "/"]) # Reduced, power can be unstable
+    
+    MAX_EXPRESSION_TREE_DEPTH: int = 4 
+    MAX_EXPECTED_COMPLEXITY_FOR_INTEGRITY: float = 15.0 # Adjusted
+    
+    # Diffusion Simulation Parameters controlled by AGE_Config
+    DIFFUSION_N_PARAM: int = 50 # Spatial points in diffusion
+    DIFFUSION_T_PARAM: int = 50 # Time steps in diffusion
+    BASE_KERNEL_SHAPE_PARAM: np.ndarray = field(default_factory=lambda: np.array([0.25, 0.5, 0.25]))
+
+    RATE_K: float=0.02; RATE_L: float=0.06; RATE_D: float=0.05 
+    RATE_G: float=0.04; RATE_M: float=0.04
+    EMERGENCE_EVENT_BOOST_E: float = 0.35 
+    EMERGENCE_INTEGRAL_FACTOR_EPSILON: float = 0.2
+    
+    # No longer needed: FUNC_DISCOVERY_X_VALS, FUNC_DISCOVERY_Y_TARGET_VALS
+    # def __post_init__(self):
+    #     self.FUNC_DISCOVERY_Y_TARGET_VALS = _generate_target_dataset_ys_for_config(self.FUNC_DISCOVERY_X_VALS)
+
+AGE_CONF = AGE_Config() # Initialize global config
+
+# --- Helper Functions ---
+def normalize_score(value,min_val=0.0,max_val=1.0)->float:return max(min_val,min(max_val,float(value)))
+
+def logistic_growth(current_val:float,max_val:float,growth_rate:float,positive_event_strength:float=1.0)->float:
+    cv=normalize_score(current_val,0,max_val);
+    if abs(max_val)<1e-9 or cv>=max_val:return cv     
+    eff_s=normalize_score(positive_event_strength,0,1);growth=growth_rate*eff_s*(max_val-cv)
+    return normalize_score(cv+growth,0,max_val)
+
+# --- Algorithmic Genesis Engine ---
+class AlgorithmicGenesisEngine:
+    def __init__(self):
+        # Substrate richness based on new variables and ops for diffusion kernel control
+        substrate_richness=(len(AGE_CONF.AVAILABLE_VARIABLES)+1+len(AGE_CONF.AVAILABLE_UNARY_OPS)+len(AGE_CONF.AVAILABLE_BINARY_OPS))
+        # Total possible ops in the _UNARY_OPS_MATH and _BINARY_OPS_MATH dictionaries
+        total_ops_defined = len(_UNARY_OPS_MATH) + len(_BINARY_OPS_MATH)
+        self.K_SubstrateMastery:float=normalize_score(substrate_richness/(len(AGE_CONF.AVAILABLE_VARIABLES)+1+total_ops_defined)) if total_ops_defined > 0 else 0.1             
+        self.L_CompositionalGenerativity:float=0.15; self.D_DynamicStability:float=0.1 
+        self.G_StructuralIntegrity:float=0.15; self.M_MetaCompositionalAwareness:float=0.05 
+        self.E_EmergenceEventFactor:float=0.0; self.Omega_GenesisQuotient_Integral:float=0.0
+        self.cycle_count:int=0; self.harmonic_library:List[ComposedStructure]=[]
+        self.kb_novelty_tracker_age:set[str]=set(); self.current_composition_rules_version:float=0.1
+        print(f"AGE Initialized for Diffusion Kernel Discovery. K_SubstrateMastery={self.K_SubstrateMastery:.3f} (Substrate Richness: {substrate_richness})")
+
+    def _log_omega_factors(self,stage_prefix=""):print(f"{stage_prefix} Ω Factors: K={self.K_SubstrateMastery:.3f},Λ={self.L_CompositionalGenerativity:.3f},Δ={self.D_DynamicStability:.3f},Γ={self.G_StructuralIntegrity:.3f},M={self.M_MetaCompositionalAwareness:.3f},E={self.E_EmergenceEventFactor:.3f}")
+    
+    def stage_I_ingest_primitives(self): 
+        print(f"Cyc {self.cycle_count}: Stage I - Substrate Review..."); 
+        self.K_SubstrateMastery=logistic_growth(self.K_SubstrateMastery,1.0,AGE_CONF.RATE_K,0.01) 
+    
+    def _generate_expression_tree(self,current_depth:int,max_depth:int)->Optional[ExpressionNode]:
+        # Same generation logic as original AGE, using new AVAILABLE_VARIABLES and OPS from AGE_CONF
+        if current_depth>=max_depth:node_type=random.choice(["var","const"])
+        else:
+            term_prob=0.2 + 0.5*(current_depth/max_depth) 
+            if random.random()<term_prob or not (AGE_CONF.AVAILABLE_UNARY_OPS or AGE_CONF.AVAILABLE_BINARY_OPS) : node_type=random.choice(["var","const"])
+            else:node_type=random.choice(["unary_op","binary_op","unary_op","binary_op","binary_op"])
+        
+        if node_type=="var":
+            return VariableNode(name=random.choice(AGE_CONF.AVAILABLE_VARIABLES)) if AGE_CONF.AVAILABLE_VARIABLES else ConstantNode(float(random.randint(0,1)))
+        
+        if node_type=="const":
+            min_c,max_c=AGE_CONF.CONSTANT_GENERATION_RANGE
+            # Bias towards smaller constants for weight components
+            if random.random() < 0.6: 
+                val = random.uniform(min_c/2, max_c/2)
+            elif random.random() < 0.85:
+                val = float(random.randint(int(min_c),int(max_c)))
+            else:
+                val = random.uniform(min_c, max_c)
+            return ConstantNode(value=round(val,3))
+
+        elif node_type=="unary_op":
+            if AGE_CONF.AVAILABLE_UNARY_OPS:
+                op_name=random.choice(AGE_CONF.AVAILABLE_UNARY_OPS);op=self._generate_expression_tree(current_depth+1,max_depth)
+                if op: return UnaryOpNode(op_name=op_name,operand=op)
+            # Fallback if unary op fails or not available
+            if current_depth < max_depth and AGE_CONF.AVAILABLE_BINARY_OPS : node_type="binary_op" 
+            else: return self._generate_expression_tree(current_depth,max_depth) # Try to make a terminal node
+        
+        if node_type=="binary_op": # Check if this was a fall-through from unary
+            if AGE_CONF.AVAILABLE_BINARY_OPS:
+                op_name=random.choice(AGE_CONF.AVAILABLE_BINARY_OPS);l=self._generate_expression_tree(current_depth+1,max_depth);r=self._generate_expression_tree(current_depth+1,max_depth)
+                if l and r:return BinaryOpNode(op_name=op_name,left=l,right=r)
+        
+        # Ultimate fallback if all fails
+        return VariableNode(name=random.choice(AGE_CONF.AVAILABLE_VARIABLES)) if AGE_CONF.AVAILABLE_VARIABLES else ConstantNode(1.0) 
+
+    def stage_II_weave_candidates(self)->List[ComposedStructure]:
+        print(f"Cyc {self.cycle_count}: Stage II - Weaving Expression Trees for Kernel Logic...")
+        candidates:List[ComposedStructure]=[];gen_complexities=[]
+        for _ in range(AGE_CONF.CANDIDATES_PER_CYCLE):
+            depth=random.randint(1,AGE_CONF.MAX_EXPRESSION_TREE_DEPTH); 
+            root=self._generate_expression_tree(0,depth)
+            if root: 
+                struct=ComposedStructure(expression_tree_root=root,composition_rules_version=self.current_composition_rules_version); 
+                candidates.append(struct);
+                gen_complexities.append(struct.complexity_score)
+        
+        avg_cplx_val = np.mean(gen_complexities) if gen_complexities else 0.0
+        if candidates:
+            avg_nov=np.mean([c.novelty_score for c in candidates]);
+            norm_cplx=normalize_score(avg_cplx_val/AGE_CONF.MAX_EXPECTED_COMPLEXITY_FOR_INTEGRITY)
+            lambda_str=(len(candidates)/AGE_CONF.CANDIDATES_PER_CYCLE)*(avg_nov*0.35+norm_cplx*0.35+0.3) 
+            self.L_CompositionalGenerativity=logistic_growth(self.L_CompositionalGenerativity,1.0,AGE_CONF.RATE_L,lambda_str)
+        else:self.L_CompositionalGenerativity=logistic_growth(self.L_CompositionalGenerativity,1.0,AGE_CONF.RATE_L,0.0)
+        print(f"  Wove {len(candidates)} exprs. AvgCmplx: {avg_cplx_val:.1f}. Λ={self.L_CompositionalGenerativity:.3f}")
+        return candidates
+
+    def stage_III_test_resonance_integrity(self, candidates: List[ComposedStructure]) -> List[ComposedStructure]:
+        print(f"Cyc {self.cycle_count}: Stage III - Evaluating Expression Fitness via Diffusion Simulation...")
+        stable_integral_structures: List[ComposedStructure] = []
+        if not candidates: 
+            self.D_DynamicStability=logistic_growth(self.D_DynamicStability,1.0,AGE_CONF.RATE_D,0.0); 
+            self.G_StructuralIntegrity=logistic_growth(self.G_StructuralIntegrity,1.0,AGE_CONF.RATE_G,0.0); 
+            return stable_integral_structures
+
+        total_fitness_score_D=0.0;total_integrity_score_G=0.0;found_good_fit_this_stage=False
+        
+        for struct_idx, struct in enumerate(candidates):
+            if not struct.expression_tree_root: 
+                struct.stability_score=0.0;struct.integrity_score=0.0;continue
+
+            # print(f"  Testing candidate {struct_idx+1}/{len(candidates)}: {struct.get_expression_string()[:50]}...") # Verbose
+            final_grid_state, _ = run_diffusion_simulation(
+                struct.expression_tree_root,
+                AGE_CONF.AVAILABLE_VARIABLES,
+                AGE_CONF.DIFFUSION_N_PARAM,
+                AGE_CONF.DIFFUSION_T_PARAM,
+                AGE_CONF.BASE_KERNEL_SHAPE_PARAM
+            )
+            
+            current_diffusion_fitness = calculate_diffusion_fitness(final_grid_state, AGE_CONF.DIFFUSION_N_PARAM)
+            
+            struct.stability_score = normalize_score(current_diffusion_fitness) 
+            struct.evaluation_details['diffusion_fitness'] = current_diffusion_fitness
+            # successful_eval_ratio equivalent: 1.0 if fitness > 0 else 0.0
+            struct.evaluation_details['simulation_successful_ratio'] = 1.0 if current_diffusion_fitness > 1e-6 else 0.0
+
+            norm_inv_complexity = normalize_score(1.0-(struct.complexity_score/AGE_CONF.MAX_EXPECTED_COMPLEXITY_FOR_INTEGRITY))
+            struct.integrity_score=normalize_score(struct.stability_score * norm_inv_complexity) 
+            
+            canonical_form_str = struct.get_canonical_form(); 
+            struct.evaluation_details['canonical_form_stage3']=canonical_form_str
+            if canonical_form_str: 
+                struct.novelty_score=(0.5+struct.novelty_score*0.5) if canonical_form_str not in self.kb_novelty_tracker_age else struct.novelty_score*0.1
+            
+            if current_diffusion_fitness > AGE_CONF.EMERGENCE_FITNESS_THRESHOLD : # Emergence based on new fitness
+                struct.is_emergent_event=True; found_good_fit_this_stage=True
+            
+            total_fitness_score_D+=struct.stability_score; 
+            total_integrity_score_G+=struct.integrity_score
+            
+            if struct.stability_score >= AGE_CONF.STABILITY_THRESHOLD_FITNESS and struct.integrity_score >= AGE_CONF.INTEGRITY_THRESHOLD_FITNESS: 
+                stable_integral_structures.append(struct)
+        
+        avg_fitness_D = total_fitness_score_D/len(candidates) if candidates else 0.0
+        avg_integrity_G = total_integrity_score_G/len(candidates) if candidates else 0.0
+        self.D_DynamicStability=logistic_growth(self.D_DynamicStability,1.0,AGE_CONF.RATE_D, avg_fitness_D)
+        self.G_StructuralIntegrity=logistic_growth(self.G_StructuralIntegrity,1.0,AGE_CONF.RATE_G, avg_integrity_G)
+        
+        if found_good_fit_this_stage: 
+            self.E_EmergenceEventFactor=logistic_growth(self.E_EmergenceEventFactor,1.0,1.0,AGE_CONF.EMERGENCE_EVENT_BOOST_E*1.2);
+        
+        print(f"  Tested {len(candidates)}. Found {len(stable_integral_structures)} fit&integral. AvgSpreadFit={avg_fitness_D:.3f}. Δ(Fit)={self.D_DynamicStability:.3f},Γ={self.G_StructuralIntegrity:.3f}")
+        return stable_integral_structures
+
+    def stage_IV_synthesize_reflect_emerge(self, successful_structures: List[ComposedStructure]): 
+        print(f"Cyc {self.cycle_count}: Stage IV - Harmonic Synthesis & Meta-Reflection...");
+        self.E_EmergenceEventFactor*=0.8 # Decay emergence factor slightly
+        archived_this_cycle=0; successful_rules_evidence=0
+        
+        successful_structures.sort(key=lambda s:s.stability_score+s.integrity_score+s.novelty_score, reverse=True)
+        
+        for struct in successful_structures:
+            novelty_key=struct.get_canonical_form();
+            if novelty_key is None: continue # Skip if no canonical form
+            
+            if novelty_key not in self.kb_novelty_tracker_age:
+                self.harmonic_library.append(struct); 
+                self.kb_novelty_tracker_age.add(novelty_key); 
+                archived_this_cycle+=1
+                if struct.is_emergent_event : 
+                    self.E_EmergenceEventFactor=logistic_growth(self.E_EmergenceEventFactor,1.0,1.0,AGE_CONF.EMERGENCE_EVENT_BOOST_E)
+            
+            if abs(struct.composition_rules_version-self.current_composition_rules_version)<1e-3: 
+                successful_rules_evidence+=1
+        
+        meta_update_strength=0.0
+        if successful_structures:
+            meta_update_strength=successful_rules_evidence/len(successful_structures) if len(successful_structures)>0 else 0.0
+            if meta_update_strength > 0.6 and random.random()<0.35: 
+                self.current_composition_rules_version=round(self.current_composition_rules_version+0.01,3)
+        
+        self.M_MetaCompositionalAwareness=logistic_growth(self.M_MetaCompositionalAwareness,1.0,AGE_CONF.RATE_M,meta_update_strength)
+        
+        omega_factors_prod=(self.K_SubstrateMastery*self.L_CompositionalGenerativity*self.D_DynamicStability*self.G_StructuralIntegrity*self.M_MetaCompositionalAwareness*(1+AGE_CONF.EMERGENCE_INTEGRAL_FACTOR_EPSILON*self.E_EmergenceEventFactor))
+        self.Omega_GenesisQuotient_Integral+=omega_factors_prod
+        
+        avg_omega_per_cycle=self.Omega_GenesisQuotient_Integral/self.cycle_count if self.cycle_count>0 else omega_factors_prod
+        print(f"  Archived {archived_this_cycle} new exprs. Lib size:{len(self.harmonic_library)}. M={self.M_MetaCompositionalAwareness:.3f}");
+        self._log_omega_factors("Post-StageIV");
+        print(f"  Ω integrand:{omega_factors_prod:.4f}. Avg Ω/cyc:{avg_omega_per_cycle:.4f}")
+
+    def run_genesis_cycle(self):
+        self.cycle_count+=1;
+        print(f"\n{'='*15} AGE CYCLE {self.cycle_count} BEGIN (Target: Max Diffusion Spread) {'='*15}");
+        self._log_omega_factors("Pre-StageI")
+        self.stage_I_ingest_primitives();
+        candidate_structures=self.stage_II_weave_candidates()
+        stable_structures=self.stage_III_test_resonance_integrity(candidate_structures);
+        self.stage_IV_synthesize_reflect_emerge(stable_structures)
+        avg_omega_prog=self.Omega_GenesisQuotient_Integral/self.cycle_count if self.cycle_count>0 else 0
+        print(f"{'='*15} AGE CYCLE {self.cycle_count} END. Avg Ω={avg_omega_prog:.4f} {'='*15}")
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    # Initialize AGE_CONF (already done globally when class is defined)
+    # AGE_CONF = AGE_Config() # This would re-init if it wasn't global
+
+    age_engine = AlgorithmicGenesisEngine()
+    best_fitness_overall = -1.0 
+    best_expr_overall_str = "None"
+    best_expr_canonical_overall_str = "None"
+    best_struct_overall: Optional[ComposedStructure] = None
+
+    for i in range(AGE_CONF.MAX_CYCLES):
+        age_engine.run_genesis_cycle(); 
+        new_best_this_cycle = False
+        
+        # Check harmonic library for new best
+        for struct_in_lib in age_engine.harmonic_library: 
+            current_struct_fitness = struct_in_lib.evaluation_details.get('diffusion_fitness', -1.0)
+            if isinstance(current_struct_fitness, float) and current_struct_fitness > best_fitness_overall:
+                best_fitness_overall = current_struct_fitness
+                best_struct_overall = struct_in_lib
+                best_expr_overall_str = struct_in_lib.get_expression_string()
+                best_expr_canonical_overall_str = struct_in_lib.get_canonical_form() or best_expr_overall_str
+                new_best_this_cycle = True
+        
+        if new_best_this_cycle and best_struct_overall:
+            print(f"\n!!! NEW BEST KERNEL LOGIC Found (Cycle {i+1}) !!!")
+            print(f"    Expression: '{best_expr_overall_str}'")
+            print(f"    Canonical:  '{best_expr_canonical_overall_str}'")
+            print(f"    Achieved Diffusion Spread Fitness: {best_fitness_overall:.4f} (StabScore: {best_struct_overall.stability_score:.3f})")
+        
+        if (i+1)%5==0 or i==AGE_CONF.MAX_CYCLES-1 : # More frequent summary for this combined version
+             print(f"\n--- AGE SUMMARY AFTER CYCLE {i+1} ---");age_engine._log_omega_factors("Summary")
+             avg_omega=age_engine.Omega_GenesisQuotient_Integral/age_engine.cycle_count if age_engine.cycle_count>0 else 0
+             print(f"Avg Genesis Quotient (Ω/cycle): {avg_omega:.4f}")
+             print(f"Substrate:Vars={len(AGE_CONF.AVAILABLE_VARIABLES)},UOps={len(AGE_CONF.AVAILABLE_UNARY_OPS)},BOps={len(AGE_CONF.AVAILABLE_BINARY_OPS)}")
+             print(f"Harmonic Library:{len(age_engine.harmonic_library)} (Unique canonical:{len(age_engine.kb_novelty_tracker_age)})")
+             print(f"Meta-Rule Ver: {age_engine.current_composition_rules_version:.3f}")
+             if age_engine.harmonic_library:
+                 print("  Sample from Harmonic Library (Top 3 by Spread Fitness):")
+                 sorted_lib_sample=sorted(age_engine.harmonic_library,key=lambda s:s.evaluation_details.get('diffusion_fitness',0.0),reverse=True)
+                 for s_item_idx, s_item in enumerate(sorted_lib_sample[:min(3,len(sorted_lib_sample))]): 
+                      fit_val = s_item.evaluation_details.get('diffusion_fitness', 0.0)
+                      fit_print_str = f"{fit_val:.3f}" if isinstance(fit_val,float) else 'N/A'
+                      print(f"    {s_item_idx+1}. {s_item} (Actual Spread Fitness: {fit_print_str})") # __str__ already prints it.
+             if best_fitness_overall > -0.5 : print(f"    Best overall Spread Fitness achieved so far: {best_fitness_overall:.4f} by '{best_expr_canonical_overall_str}'")
+
+    print("\n--- FINAL AGE REPORT (Diffusion Kernel Discovery) ---");age_engine._log_omega_factors("Final")
+    final_avg_omega=age_engine.Omega_GenesisQuotient_Integral/age_engine.cycle_count if age_engine.cycle_count>0 else 0
+    print(f"Final Avg Genesis Quotient (Ω/cycle): {final_avg_omega:.4f}")
+    print(f"Final Harmonic Library:{len(age_engine.harmonic_library)}, Unique Canonical Forms:{len(age_engine.kb_novelty_tracker_age)}")
+    
+    if best_struct_overall and best_fitness_overall >= AGE_CONF.EMERGENCE_FITNESS_THRESHOLD :
+        print(f"SUCCESS: An expression achieved a Spread Fitness of {best_fitness_overall:.4f} (Threshold: {AGE_CONF.EMERGENCE_FITNESS_THRESHOLD}).")
+        print(f"  Best fitting expression for kernel logic: '{best_expr_canonical_overall_str}'")
+    elif best_fitness_overall > -0.5:
+        print(f"INFO: No expression achieved the target Spread Fitness threshold of {AGE_CONF.EMERGENCE_FITNESS_THRESHOLD}.")
+        print(f"  Best Spread Fitness found: {best_fitness_overall:.4f} by expression: '{best_expr_canonical_overall_str}'")
+    else:
+        print("INFO: No viable expressions for kernel logic were found or significantly evaluated.")
+
+    # Visualize the diffusion from the best expression found
+    if best_struct_overall:
+        print(f"\nVisualizing diffusion with the best discovered kernel logic: {best_struct_overall.get_expression_string()}")
+        _, final_full_grid = run_diffusion_simulation(
+            best_struct_overall.expression_tree_root,
+            AGE_CONF.AVAILABLE_VARIABLES,
+            AGE_CONF.DIFFUSION_N_PARAM,
+            AGE_CONF.DIFFUSION_T_PARAM,
+            AGE_CONF.BASE_KERNEL_SHAPE_PARAM,
+            visualize=True
+        )
+        if final_full_grid is not None:
+            plt.figure(figsize=(12, 6))
+            plt.imshow(final_full_grid, cmap='inferno', aspect='auto', origin='lower')
+            plt.title(f"Diffusion with AGE-Discovered Kernel Logic\nFitness: {best_fitness_overall:.4f}\nExpr: {best_struct_overall.get_expression_string()[:80]}")
+            plt.xlabel("Position")
+            plt.ylabel("Time")
+            plt.colorbar(label="Concentration")
+            plt.tight_layout()
+            plt.show()
+        else:
+            print("Could not run simulation for the best expression for visualization (it might have failed previously).")
